@@ -3,6 +3,17 @@
 
 #include "../tester/utils.h"
 
+// 错误检查宏 (Host端使用)
+#define CUDA_CHECK(call)                                                       \
+  do {                                                                         \
+    cudaError_t err = call;                                                    \
+    if (err != cudaSuccess) {                                                  \
+      printf("CUDA error at %s:%d - %s\n", __FILE__, __LINE__,                 \
+             cudaGetErrorString(err));                                         \
+      exit(EXIT_FAILURE);                                                      \
+    }                                                                          \
+  } while (0)
+
 /**
  * @brief Computes the trace of a matrix.
  *
@@ -17,10 +28,139 @@
  * @param cols Number of columns in the matrix.
  * @return The trace (sum of diagonal values) of the matrix.
  */
+
+
+// *********************************************************************
+// device 辅助函数
+// *********************************************************************
+// warp 级归约：在一个 warp (32 threads) 内求和
+// 参数 val 是每个线程的局部和
+// 返回值是该 warp 内所有线程的和，lane 0 获得最终结果
+// 使用洗牌指令进行 warp 内树状下行归约求和，不需要访问 shared memory，速度最快
+template <typename T>
+__device__ __forceinline__ T warp_reduce_sum(T val) {
+  
+  #pragma unroll  // 告诉编译器把循环展开以提高性能
+  for (int offset = 16; offset > 0; offset /= 2) {
+    // __shfl_down_sync(mask, val, offset)、
+    // 0xffffffff 转换为2进制为32个1，表示一个warp内的32个线程都参与，
+    // 直接指定所有线程参与，存在潜在风险，数据尾部 warp 内线程并非全部启用（暂且忽略）
+    // val 表示当前线程的值
+    // offset 表示偏移量，即指示当前线程从哪个线程的寄存器取值进行加法
+    val += __shfl_down_sync(0xffffffff, val, offset);
+  }
+  return val;
+}
+
+// *********************************************************************
+// Trace Kernel
+// *********************************************************************
+// 采用 Grid-Stride Loop 模式，可以处理任意大小的矩阵，不受限于 Grid 大小
+template <typename T>
+__global__ void trace_kernel(T* __restrict__ result, const T* __restrict__ matrix, size_t rows, size_t cols) {
+  
+  // extern __shared__ T smem[];                       // 动态分配 shared memory
+  // 为避免模板类型冲突，首先将共享内存声明为无符号字节数组
+  extern __shared__ unsigned char smem_raw[]; 
+  // 再将其强制转换为 T 类型指针
+  T* smem = reinterpret_cast<T*>(smem_raw);
+  size_t N = (rows < cols) ? rows : cols;              // 选取较小的维度作为对角线长度
+  size_t tid = threadIdx.x;                            // block 内线程索引
+  size_t idx = blockIdx.x * blockDim.x + threadIdx.x;  // 全局线程索引
+  size_t stride = blockDim.x * gridDim.x;              // grid 内总线程数
+  size_t lane = tid % 32;     // warp 内线程索引
+  size_t wid = tid / 32;      // warp 索引
+
+  // Grid-Stride Loop: 
+  // 当对角线长度超过 grid 内线程总数时，循环处理
+  // 允许用有限的线程处理无限大的数据
+  T sum = 0;
+  for (size_t i = idx; i < N; i += stride) {
+    // 对角线元素索引
+     sum += matrix[i * cols + i];
+  }
+
+  // 首先完成 warp 内归约求和
+  T warp_sum = warp_reduce_sum(sum);
+
+  // 在 block 内对 warp 结果进行求和
+  // 需要借助 shared memory 实现结果汇总
+  // 每个 warp 的第一个线程将 warp 内求和的结果写入 shared memory
+  if (lane == 0) {
+    smem[wid] = warp_sum;
+  }
+  __syncthreads(); // 等待所有 warp 写完
+
+  if (wid == 0) {
+    // 由第一个 warp 读取 shared memory 中的值，并再次进行 warp 归约
+    // 有效线程获得各个 warp 的归约求和结果，无效线程获得 T(0)，可保证32个线程全部启动
+    T block_sum = (tid < (blockDim.x + 31)/32) ? smem[lane] : T(0);
+    block_sum = warp_reduce_sum(block_sum);
+    
+    // Block 的结果原子加到全局内存
+    if (threadIdx.x == 0) {
+      atomicAdd(result, block_sum);
+    }
+  }
+}
+
+// *********************************************************************
+// Host 端接口函数
+// *********************************************************************
 template <typename T>
 T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
-  // TODO: Implement the trace function
-  return T(-1);
+  // 边界条件检查，空矩阵直接返回0
+  if (h_input.empty() || rows == 0 || cols == 0) return T(0);
+
+  // 空间分配
+  T* d_input = nullptr;
+  T* d_result = nullptr;
+  size_t size_bytes = h_input.size() * sizeof(T);
+  CUDA_CHECK(cudaMalloc(&d_input, size_bytes));
+  CUDA_CHECK(cudaMalloc(&d_result, sizeof(T)));
+    
+  // 数据拷贝
+  CUDA_CHECK(cudaMemcpy(d_input, h_input.data(), size_bytes, cudaMemcpyHostToDevice));
+  // 结果初始化为0
+  CUDA_CHECK(cudaMemset(d_result, 0, sizeof(T)));
+
+  // Kernel 参数设定
+  size_t N = (rows < cols) ? rows : cols;  // 选取较小的维度作为对角线长度
+  size_t block_size = 256;                 // 直接设定每个 block 启动 256 个线程
+  // 计算 shared memory 大小，按 Block 内 warp 数量分配
+  size_t smem_size = ((block_size + 31) / 32) * sizeof(T);
+  // 获取设备上 SM 数量
+  int deviceId;
+  int num_sms;
+  CUDA_CHECK(cudaGetDevice(&deviceId));
+  CUDA_CHECK(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, deviceId));
+  // fprintf(stderr, "Device %d has %d SMs\n", deviceId, num_sms);
+  // 计算 grid size
+  // int blocks_per_sm = 8; // 每个 SM 运行的 Block 数
+  // size_t target_grid_size = num_sms * blocks_per_sm;
+  int max_active_blocks_per_sm;
+  cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_active_blocks_per_sm, 
+                                                trace_kernel<T>, block_size, smem_size);
+  size_t target_grid_size = num_sms * max_active_blocks_per_sm;
+  // fprintf(stderr, "Max active blocks per SM: %d, target grid size: %zu\n", max_active_blocks_per_sm, target_grid_size);
+  // 边界处理：如果数据很少，不需要启动那么多 block
+  size_t needed_blocks = (N + block_size - 1) / block_size;
+  // 取二者较小值
+  size_t grid_size = std::min((size_t)target_grid_size, needed_blocks);
+  
+  // Kernel 启动
+  trace_kernel<<<grid_size, block_size, smem_size>>>(d_result, d_input, rows, cols);
+  CUDA_CHECK(cudaGetLastError()); // 检查启动错误
+
+  // 结果拷贝回 Host
+  T h_result;
+  CUDA_CHECK(cudaMemcpy(&h_result, d_result, sizeof(T), cudaMemcpyDeviceToHost));
+
+  // 释放设备内存
+  CUDA_CHECK(cudaFree(d_input));
+  CUDA_CHECK(cudaFree(d_result));
+
+  return h_result;
 }
 
 /**
@@ -39,12 +179,385 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
  * @param[in] head_dim Dimension size of each attention head
  * @param[in] is_causal Whether to apply causal masking
  */
+
+
+// *********************************************************************
+// device 辅助函数
+// *********************************************************************
+
+// warp 级归约求最大值
+// 参数 val 是每个线程的局部最大值
+// 返回值是该 warp 内所有线程的最大值
+__device__ __forceinline__ float warp_reduce_max(float val) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        float other = __shfl_down_sync(0xffffffff, val, offset);
+        val = fmaxf(val, other);  // fmaxf 是CUDA内置的设备函数，被编译器高度优化，内联执行
+    }
+    return val;
+}
+
+// warp 级归约求和 (Flash Attention 版)
+// 与 trace 中的 warp_reduce_sum 类似，但专门用于 float 类型
+__device__ __forceinline__ float warp_reduce_sum_fa(float val) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    }
+    return val;
+}
+
+// 类型转换函数：
+// 将 half/float 转换为 float 进行计算
+// half 类型的数学运算精度有限，在中间计算中使用 float 以保证精度
+__device__ __forceinline__ float to_float(float x) { return x; }
+__device__ __forceinline__ float to_float(half x) { return __half2float(x); }
+// 将 float 计算结果转回目标类型
+__device__ __forceinline__ float from_float(float x, float*) { return x; }
+__device__ __forceinline__ half from_float(float x, half*) { return __float2half(x); }
+
+// 限制输入范围，避免 exp 溢出产生 inf
+// 88.0f 约为 log(FLT_MAX)，超过此值 expf 会返回 inf
+__device__ __forceinline__ float safe_exp(float x) {
+    return expf(fminf(x, 88.0f));
+}
+
+
+// *********************************************************************
+// Flash Attention Kernel
+// *********************************************************************
+
+// 对输入参数加上指针别名限制关键字 __restrict__
+// 告诉编译器“该指针是对应内存空间的唯一访问入口”，使得编译器可以做更多优化
+template <typename T>
+__global__ void flash_attention_kernel(
+    T* __restrict__ output,
+    const T* __restrict__ query,
+    const T* __restrict__ key,
+    const T* __restrict__ value,
+    int batch_size,      // 数据批次
+    int tgt_seq_len,     // 目标序列长度（Q 的长度）
+    int src_seq_len,     // 源序列长度（K/V 的长度）
+    int query_heads,     // Query 的头数
+    int kv_heads,        // K/V 的头数（源数据的分组，支持GQA）
+    int head_dim,        // 向量维度（Query 包含多少个特征）
+    bool is_causal,      // 是否因果遮罩
+    float scale,         // 缩放因子 1/sqrt(head_dim)
+    int KV_BLOCK_SIZE    // 每次处理的 K/V token 的数量
+) {
+    // Block 和线程索引映射
+    // Grid: (tgt_seq_len, query_heads, batch_size)
+    // 每个 block 负责计算一个 (batch, head, query_pos) 对应的输出向量
+    int q_pos = blockIdx.x;      // 当前处理的 query position
+    int head_idx = blockIdx.y;   // query head 索引
+    int batch_idx = blockIdx.z;  // batch 索引
+    int tid = threadIdx.x;       // block 内线程索引
+    
+    // 边界检查
+    if (q_pos >= tgt_seq_len) return;
+    
+    // GQA 映射：多个 query heads 共享同一个 kv head
+    int heads_per_group = query_heads / kv_heads; // 每组源数据被多少个 query head 查询，标准 attention 时为1
+    int kv_head_idx = head_idx / heads_per_group; // 计算每个 query head 对应的 kv head 索引
+
+    // Shared Memory 分配：
+    // smem_Q: [head_dim]
+    // smem_K: [KV_BLOCK, head_dim]
+    // smem_V: [KV_BLOCK, head_dim]
+    // smem_scores: [KV_BLOCK]
+    // smem_reduce: [32] (用于归约)
+    // smem_output: [head_dim] (输出累加器)
+    extern __shared__ float smem[];                               // 申请共享内存空间
+    float* smem_Q = smem;                                         // 当前 query 向量 [head_dim] 
+    float* smem_K = smem_Q + head_dim;                            // 当前 K 向量 [KV_BLOCK, head_dim+1] (padding)
+    float* smem_V = smem_K + KV_BLOCK_SIZE * (head_dim + 1);      // 当前 V 向量 [KV_BLOCK, head_dim+1] (padding)
+    float* smem_scores = smem_V + KV_BLOCK_SIZE * (head_dim + 1); // 当前 attention scores [KV_BLOCK]
+    float* smem_reduce = smem_scores + KV_BLOCK_SIZE;             // 归约临时空间 [32]
+    float* smem_output = smem_reduce + 32;                        // 输出累加器 [head_dim]
+    
+    // 计算各张量的内存地址偏移
+    // 数据形状: [batch, seq_len, num_heads, head_dim]
+    // Q 的偏移计算
+    size_t q_batch_stride = (size_t)tgt_seq_len * query_heads * head_dim;
+    size_t q_seq_stride = (size_t)query_heads * head_dim;
+    size_t q_head_stride = (size_t)head_dim;
+    size_t q_offset = batch_idx * q_batch_stride + q_pos * q_seq_stride + head_idx * q_head_stride;
+    // K/V 的偏移计算 (K/V 序列需要被遍历，所以此处偏移不计算 kv_seq_stride)
+    size_t kv_batch_stride = (size_t)src_seq_len * kv_heads * head_dim;
+    size_t kv_seq_stride = (size_t)kv_heads * head_dim;
+    size_t kv_head_stride = (size_t)head_dim;
+    size_t kv_offset = batch_idx * kv_batch_stride + kv_head_idx * kv_head_stride;
+
+    // 加载当前 query 向量到 shared memory
+    // 每个线程负责加载 head_dim / blockDim.x 个元素
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        smem_Q[d] = to_float(query[q_offset + d]);
+    }
+    
+    // 初始化输出累加器为 0
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        smem_output[d] = 0.0f;
+    }
+    __syncthreads();
+    
+    // 设定 K/V 终止点
+    // causal masking: 只考虑 k_pos <= q_pos 的位置
+    int k_end = is_causal ? min(q_pos + 1, src_seq_len) : src_seq_len;
+    
+    // 在线 Softmax 状态变量初始化
+    // online_max: 当前出现的所有 attention score 的最大值
+    // online_sum: exp(score - max) 的累加和
+    float online_max = -1e30f; // 初始化为一个非常小的值
+    float online_sum = 0.0f;   // 初始化为0
+    
+
+    // ********* 分块遍历所有 K/V *********
+    // 每次处理 KV_BLOCK_SIZE 个 K/V
+    for (int k_start = 0; k_start < k_end; k_start += KV_BLOCK_SIZE) {
+
+        // 计算当前块的实际结束位置和长度
+        int k_block_end = min(k_start + KV_BLOCK_SIZE, k_end);
+        int k_block_len = k_block_end - k_start;
+        
+
+        // 加载当前 K, V 块到 shared memory
+        // 合并访存，使得每个 warp 可以抓取连续的数据
+        int kv_elements = k_block_len * head_dim;
+        for (int i = tid; i < kv_elements; i += blockDim.x) {
+            int n = i / head_dim;     // K/V 块内的 token 索引，一个 token 就是一个维度为 head_dim 的向量
+            int d = i % head_dim;     // head_dim 维度的索引
+            int k_pos = k_start + n;  // 全局 K/V position
+            
+            size_t kv_idx = kv_offset + k_pos * kv_seq_stride + d;
+            smem_K[n * (head_dim + 1) + d] = to_float(key[kv_idx]);    // padding
+            smem_V[n * (head_dim + 1) + d] = to_float(value[kv_idx]);  // padding
+        }
+        __syncthreads();
+        
+
+        // 计算 attention scores: S = Q @ K^T * scale
+        // 当 KV_BLOCK_SIZE > blockDim.x 时，需要循环计算
+        for (int n = tid; n < k_block_len; n += blockDim.x) {
+            float score = 0.0f;
+            // 点积计算
+            #pragma unroll
+            for (int d = 0; d < head_dim; d++) {
+                score += smem_Q[d] * smem_K[n * (head_dim + 1) + d];  // padding
+            }
+            smem_scores[n] = score * scale;
+        }
+        __syncthreads();
+
+
+        // 在线 Softmax 之 —— 计算当前块的最大值
+        // warp 级和 block 级归约
+        float max = -1e30f;
+        // 当 KV_BLOCK_SIZE > blockDim.x 时，需要循环计算
+        for (int n = tid; n < k_block_len; n += blockDim.x) {
+            max = fmaxf(max, smem_scores[n]);
+        }
+
+        // Warp 级归约求最大值
+        float warm_max = warp_reduce_max(max);
+
+        // 每个 warp 的结果写入 shared memory
+        int lane = tid % 32;
+        int wid = tid / 32;
+        if (lane == 0) {
+            smem_reduce[wid] = warm_max;
+        }
+        __syncthreads();
+
+        // 第一个 warp 完成 block 内的归约
+        float block_max = -1e30f;
+        if (wid == 0) {
+            // 由第一个 warp 读取 shared memory 中的值，并再次进行 warp 归约
+            block_max = (tid < (blockDim.x + 31)/32) ? smem_reduce[lane] : -1e30f;
+            block_max = warp_reduce_max(block_max);
+            // 写回共享内存，让所有 warp 都能看到
+            if (lane == 0) smem_reduce[0] = block_max;
+        }
+        __syncthreads();
+        block_max = smem_reduce[0];
+
+
+        // 在线 Softmax 之 —— 计算缩放因子并更新状态
+        // online_max 表示：之前所有块的最大值
+        // block_max 表示：当前块的最大值
+        // 新的全局最大值 new_max = max(online_max, block_max)
+        float new_max = fmaxf(online_max, block_max);      // 更新全局最大值
+        float scale_old = safe_exp(online_max - new_max);  // 用于缩放之前累加的结果
+        float scale_new = safe_exp(block_max - new_max);   // 用于缩放当前块的结果
+        
+        // 计算 exp(score - block_max) 并求和
+        float sum = 0.0f;
+        for (int n = tid; n < k_block_len; n += blockDim.x) {
+            float exp_val = safe_exp(smem_scores[n] - block_max);
+            smem_scores[n] = exp_val;    // 存储 exp 值为后续给 V 加权使用
+            sum += exp_val;
+        }
+
+        // 首先完成 warp 内归约求和
+        float warp_sum = warp_reduce_sum_fa(sum);
+
+        // 在 block 内对 warp 结果进行求和
+        // 需要借助 shared memory 实现结果汇总
+        // 每个 warp 的第一个线程将 warp 内求和的结果写入 shared memory
+        if (lane == 0) {
+            smem_reduce[wid] = warp_sum;
+        }
+        __syncthreads(); // 等待所有 warp 写完
+
+        // 用第一个 warp 完成 block 内的归约
+        float block_sum = 0.0f;
+        if (wid == 0) {
+            // 由第一个 warp 读取 shared memory 中的值，并再次进行 warp 归约
+            block_sum = (tid < (blockDim.x + 31)/32) ? smem_reduce[lane] : 0.0f;
+            block_sum = warp_reduce_sum_fa(block_sum);
+            // 写回共享内存，让所有 warp 都能看到
+            if (lane == 0) smem_reduce[0] = block_sum;
+        }
+        __syncthreads();
+        block_sum = smem_reduce[0];
+
+        
+        // 更新 online sum
+        float new_sum = online_sum * scale_old + block_sum * scale_new;
+        
+
+        // 更新输出累加器
+        // O_new = O_old * scale_old + (P @ V) * scale_new
+        // 把 scale_new 放到循环外，减少乘法计算
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+            
+            // 计算当前块 P @ V 的累加和（未缩放）
+            float pv_sum = 0.0f;
+            #pragma unroll
+            for (int n = 0; n < k_block_len; n++) {
+                pv_sum += smem_scores[n] * smem_V[n * (head_dim + 1) + d];
+            }
+
+            // O_new = (O_old * scale_old) + (pv_sum * scale_new)
+            smem_output[d] *= scale_old;
+            smem_output[d] += pv_sum * scale_new;
+        }
+        __syncthreads();
+        
+        // 更新状态
+        online_max = new_max;
+        online_sum = new_sum;
+    }
+    
+ 
+    // 最终归一化并写回结果
+    // O_final = O / online_sum
+    // 先计算 sum_inverse ，并避免除以0
+    float sum_inv = (online_sum > 0.0f) ? (1.0f / online_sum) : 0.0f;
+    // 计算 O_final 并写回全局内存
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        float out_val = smem_output[d] * sum_inv;
+        output[q_offset + d] = from_float(out_val, (T*)nullptr);
+    }
+}
+
+// *********************************************************************
+// Host 端接口函数
+// *********************************************************************
 template <typename T>
 void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
                     const std::vector<T>& h_v, std::vector<T>& h_o,
                     int batch_size, int target_seq_len, int src_seq_len, 
                     int query_heads, int kv_heads, int head_dim, bool is_causal) {       
-  // TODO: Implement the flash attention function
+    
+    // 边界条件检查，空数据直接返回
+    if (h_q.empty() || h_k.empty() || h_v.empty() ||
+        batch_size == 0 || target_seq_len == 0 || src_seq_len == 0 ||
+        query_heads == 0 || kv_heads == 0 || head_dim == 0) {
+        return;
+    }
+    
+    // 计算缩放因子: scale = 1 / sqrt(head_dim)
+    float scale = 1.0f / sqrtf((float)head_dim);
+
+
+    // 设备内存分配
+    T* d_q = nullptr;
+    T* d_k = nullptr;
+    T* d_v = nullptr;
+    T* d_o = nullptr;
+    size_t q_size = (size_t)batch_size * target_seq_len * query_heads * head_dim * sizeof(T);
+    size_t kv_size = (size_t)batch_size * src_seq_len * kv_heads * head_dim * sizeof(T);
+    size_t o_size = q_size; 
+    CUDA_CHECK(cudaMalloc(&d_q, q_size));
+    CUDA_CHECK(cudaMalloc(&d_k, kv_size));
+    CUDA_CHECK(cudaMalloc(&d_v, kv_size));
+    CUDA_CHECK(cudaMalloc(&d_o, o_size));
+    
+
+    // 数据拷贝: Host -> Device
+    CUDA_CHECK(cudaMemcpy(d_q, h_q.data(), q_size, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_k, h_k.data(), kv_size, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_v, h_v.data(), kv_size, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(d_o, 0, o_size));
+    
+
+    // Kernel 参数设定
+
+    // Flash Attention 分块参数
+    int KV_BLOCK_SIZE = 64;   // 每次从 global memory 加载的 K/V token 数量
+    int block_size = 256;     // 每个 block 的线程数
+    
+    // 计算 shared memory 大小
+    // smem_Q: head_dim
+    // smem_K: KV_BLOCK * head_dim
+    // smem_V: KV_BLOCK * head_dim
+    // smem_scores: KV_BLOCK
+    // smem_reduce: 32
+    // smem_output: head_dim
+    size_t smem_size = sizeof(float) * (
+        head_dim +                          // smem_Q
+        KV_BLOCK_SIZE * (head_dim + 1) +    // smem_K (padding)
+        KV_BLOCK_SIZE * (head_dim + 1) +    // smem_V (padding)
+        KV_BLOCK_SIZE +                     // smem_scores
+        32 +                                // smem_reduce
+        head_dim                            // smem_output
+    );
+    
+    // 检查 shared memory 是否足够
+    int deviceId;
+    CUDA_CHECK(cudaGetDevice(&deviceId));
+    cudaDeviceProp props;
+    CUDA_CHECK(cudaGetDeviceProperties(&props, deviceId));
+    if (smem_size > props.sharedMemPerBlock) {
+        fprintf(stderr, "Warning: Required shared memory (%zu bytes) exceeds limit (%zu bytes)\n",
+                smem_size, props.sharedMemPerBlock);
+    }
+    
+    // Grid 设定: 每个 block 处理一个 (batch, query_head, query_pos)
+    dim3 grid(target_seq_len, query_heads, batch_size);
+    dim3 block(block_size);
+
+
+    // Kernel 启动
+    flash_attention_kernel<<<grid, block, smem_size>>>(
+        d_o, d_q, d_k, d_v,
+        batch_size, target_seq_len, src_seq_len,
+        query_heads, kv_heads, head_dim,
+        is_causal, scale, KV_BLOCK_SIZE
+    );
+    CUDA_CHECK(cudaGetLastError());  // 检查启动错误
+
+
+    // 结果拷贝: Device -> Host
+    h_o.resize((size_t)batch_size * target_seq_len * query_heads * head_dim);
+    CUDA_CHECK(cudaMemcpy(h_o.data(), d_o, o_size, cudaMemcpyDeviceToHost));
+    
+
+    // 释放设备内存
+    CUDA_CHECK(cudaFree(d_q));
+    CUDA_CHECK(cudaFree(d_k));
+    CUDA_CHECK(cudaFree(d_v));
+    CUDA_CHECK(cudaFree(d_o));
 }
 
 // *********************************************************************
