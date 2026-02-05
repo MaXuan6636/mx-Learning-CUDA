@@ -1,5 +1,5 @@
 #include <vector>
-#include <mc_fp16.h>
+#include <common/maca_fp16.h>
 
 #include "../tester/utils.h"
 
